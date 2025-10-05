@@ -1,4 +1,4 @@
-name: Build from ZIP (auto-robust)
+name: Сборка из ZIP-архива (надёжная)
 
 on:
   workflow_dispatch:
@@ -8,10 +8,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: ШАГ 01 — Скачать код репозитория
+      - name: ШАГ 01 — Скачать репозиторий
         uses: actions/checkout@v4
 
-      - name: ШАГ 02 — Инструменты распаковки
+      - name: ШАГ 02 — Установить unzip и wget
         run: sudo apt-get update && sudo apt-get install -y unzip wget
 
       - name: ШАГ 03 — Найти ZIP и распаковать
@@ -22,16 +22,13 @@ jobs:
           echo "Найден ZIP: $ZIP"
           unzip -o "$ZIP" -d .
 
-      - name: ШАГ 04 — Найти КОРЕНЬ Gradle-проекта
+      - name: ШАГ 04 — Найти корень Gradle-проекта
         id: root
         run: |
           set -e
-          # Ищем каталог, где есть gradlew ИЛИ settings.gradle(.kts)
           ROOT="."
           CAND=$(find . -maxdepth 3 -type f \( -name gradlew -o -name settings.gradle -o -name "settings.gradle.kts" \) | head -n1 || true)
-          if [ -n "$CAND" ]; then
-            ROOT=$(dirname "$CAND")
-          fi
+          if [ -n "$CAND" ]; then ROOT=$(dirname "$CAND"); fi
           cd "$ROOT"
           echo "PROJECT_ROOT=$(pwd)" >> $GITHUB_OUTPUT
           echo "Корень проекта: $(pwd)"
@@ -43,16 +40,15 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: ШАГ 06 — Android SDK (33 и 34, с запасом)
-        uses: android-actions/setup-android@v2
-        with:
-          packages: |
-            platforms;android-33
-            build-tools;33.0.1
-            platforms;android-34
-            build-tools;34.0.0
+      - name: ШАГ 06 — Подготовить Android SDK и пакеты
+        run: |
+          set -e
+          yes | sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager --licenses
+          yes | sudo ${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-33" "build-tools;33.0.1" \
+            "platforms;android-34" "build-tools;34.0.0"
 
-      - name: ШАГ 07 — Подготовить gradle.properties (AndroidX, JVM)
+      - name: ШАГ 07 — Подготовить gradle.properties
         run: |
           set -e
           cd "${{ steps.root.outputs.PROJECT_ROOT }}"
@@ -60,8 +56,7 @@ jobs:
           grep -q '^android.useAndroidX=true' gradle.properties || echo 'android.useAndroidX=true' >> gradle.properties
           grep -q '^android.enableJetifier=true' gradle.properties || echo 'android.enableJetifier=true' >> gradle.properties
           grep -q '^org.gradle.jvmargs' gradle.properties || echo 'org.gradle.jvmargs=-Xmx3072m -Dfile.encoding=UTF-8' >> gradle.properties
-          echo "gradle.properties:"
-          cat gradle.properties
+          echo "gradle.properties:"; cat gradle.properties
 
       - name: ШАГ 08 — Если нет gradlew, сгенерировать wrapper (Gradle 8.7)
         run: |
@@ -72,39 +67,53 @@ jobs:
             wget -q https://services.gradle.org/distributions/gradle-8.7-bin.zip -O /tmp/gradle.zip
             sudo unzip -q /tmp/gradle.zip -d /opt/gradle
             export PATH="/opt/gradle/gradle-8.7/bin:$PATH"
-            gradle --version
             gradle wrapper --gradle-version 8.7
           fi
           chmod +x gradlew
           ./gradlew --version
 
-      - name: ШАГ 09 — Сборка DEBUG (подробные логи)
+      - name: ШАГ 09 — Сборка DEBUG (подробный лог)
         run: |
           set -e
           cd "${{ steps.root.outputs.PROJECT_ROOT }}"
-          ./gradlew assembleDebug --stacktrace --no-daemon
+          mkdir -p "$GITHUB_WORKSPACE/gradle-logs"
+          ./gradlew assembleDebug --stacktrace --no-daemon | tee "$GITHUB_WORKSPACE/gradle-logs/assembleDebug.log"
 
-      - name: ШАГ 10 — Сборка RELEASE (пробуем)
+      - name: ШАГ 10 — Сборка RELEASE (пробуем, ошибки не критичны)
         continue-on-error: true
         run: |
           cd "${{ steps.root.outputs.PROJECT_ROOT }}"
-          ./gradlew assembleRelease --stacktrace --no-daemon
+          mkdir -p "$GITHUB_WORKSPACE/gradle-logs"
+          ./gradlew assembleRelease --stacktrace --no-daemon | tee "$GITHUB_WORKSPACE/gradle-logs/assembleRelease.log"
 
-      - name: ШАГ 11 — Найти APK и переименовать
+      - name: ШАГ 11 — Найти APK и сложить в артефакты
         run: |
           set -e
           cd "${{ steps.root.outputs.PROJECT_ROOT }}"
-          mkdir -p ../_apks
+          OUT="$GITHUB_WORKSPACE/_apks"
+          mkdir -p "$OUT"
+          echo "Ищем APK…"
+          find . -path "*/outputs/apk/*/*" -name "*.apk" -print
           DBG=$(find . -path "*/outputs/apk/*/*" -name "*-debug*.apk" -o -name "app-debug.apk" | head -n1 || true)
           REL=$(find . -path "*/outputs/apk/*/*" -name "*-release*.apk" -o -name "app-release*.apk" | head -n1 || true)
-          [ -n "$DBG" ] && cp "$DBG" ../_apks/app-debug.apk
-          [ -n "$REL" ] && cp "$REL" ../_apks/app-release-unsigned.apk
-          cd ..
-          ls -l _apks || (echo "APK не найден"; exit 1)
+          [ -n "$DBG" ] && cp "$DBG" "$OUT/app-debug.apk"
+          [ -n "$REL" ] && cp "$REL" "$OUT/app-release-unsigned.apk"
+          ls -l "$OUT"
+          # Если совсем пусто — явно падаем, чтобы было видно
+          if [ -z "$(ls -A "$OUT")" ]; then
+            echo "APK не найден. Проверьте логи сборки."
+            exit 1
+          fi
 
-      - name: ШАГ 12 — Сохранить APK как артефакты
-        if: always()
+      - name: ШАГ 12 — Загрузить APK как артефакты
         uses: actions/upload-artifact@v4
         with:
           name: APKs
           path: _apks/
+
+      - name: ШАГ 13 — Загрузить логи Gradle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-logs
+          path: gradle-logs/
